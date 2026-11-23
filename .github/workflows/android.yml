@@ -1,0 +1,187 @@
+name: Android
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      aot:
+        description: "Run the NativeAOT probe"
+        type: boolean
+        default: false
+
+concurrency:
+  group: android
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: ${{ vars.SOURCE_REPO || 'AssetRipper/AssetRipper' }}
+  SOURCE_REF: ${{ vars.SOURCE_REF }}
+  OPENSSL_VERSION: "3.5.0"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_CONTENT != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        id: source
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          path: src
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+
+      - name: Source commit
+        id: srcsha
+        run: echo "sha=$(git -C src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Newest net<N> in the source; released SDK first, preview as fallback.
+      - name: Detect required .NET major
+        id: sdk
+        run: |
+          MAJOR=$(grep -rh "<TargetFramework" src/Source --include=*.csproj --include=Directory.Build.props | grep -oE 'net[0-9]+' | sed 's/net//' | sort -n | tail -1)
+          test -n "$MAJOR"
+          echo "major=$MAJOR" >> "$GITHUB_OUTPUT"
+          echo "Source targets .NET $MAJOR"
+
+      - id: sdk_ga
+        uses: actions/setup-dotnet@v4
+        continue-on-error: true
+        with:
+          dotnet-version: ${{ steps.sdk.outputs.major }}.0.x
+
+      - name: Fall back to the preview SDK
+        if: steps.sdk_ga.outcome == 'failure'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ steps.sdk.outputs.major }}.0.x
+          dotnet-quality: preview
+
+      - name: Show SDK
+        run: dotnet --info | head -20
+
+      - name: Resolve version
+        id: ver
+        run: |
+          UP=$(grep -oP '<VersionPrefix>\K[^<]+' src/Source/Directory.Build.props | head -1)
+          test -n "$UP"
+          N=${{ github.run_number }}
+          echo "upstream=$UP" >> "$GITHUB_OUTPUT"
+          echo "build=$N" >> "$GITHUB_OUTPUT"
+          echo "tag=v$UP-android.$N" >> "$GITHUB_OUTPUT"
+
+      - name: Apply patches
+        run: bash scripts/apply.sh
+
+      - name: Publish linux-arm64 (self-contained, no AOT)
+        run: >
+          dotnet publish src/Source/AssetRipper.GUI.Free
+          -c Release
+          -r linux-arm64
+          --self-contained
+          -p:PublishAot=false
+          -p:ServerGarbageCollection=false
+          -o out
+
+      - name: Convert to linux-bionic-arm64
+        run: bash scripts/make-bionic.sh out
+
+      # .NET needs OpenSSL; Android has none usable, so build one with the NDK.
+      - name: Cache OpenSSL for Android
+        id: ossl
+        uses: actions/cache@v4
+        with:
+          path: openssl-android
+          key: openssl-android-${{ env.OPENSSL_VERSION }}-1
+
+      - name: Build OpenSSL for Android
+        if: steps.ossl.outputs.cache-hit != 'true'
+        run: bash scripts/build-openssl.sh openssl-android
+
+      - name: Add OpenSSL to the server
+        run: cp openssl-android/* out/
+
+      - name: Bundle the server into the app
+        run: |
+          mkdir -p android/app/src/main/assets
+          (cd out && zip -qr ../android/app/src/main/assets/ar.zip .)
+          printf 'tag=%s\nupstream=%s\n' "${{ steps.ver.outputs.tag }}" "${{ steps.ver.outputs.upstream }}" \
+            > android/app/src/main/assets/ar.info
+          cp android/app/src/main/assets/ar.zip "AssetRipper-bionic-arm64-${{ steps.ver.outputs.tag }}.zip"
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: temurin
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Prepare release keystore
+        if: env.HAS_KEYSTORE == 'true'
+        env:
+          KEYSTORE_CONTENT: ${{ secrets.KEYSTORE_CONTENT }}
+          KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_CONTENT" | base64 -d > "$RUNNER_TEMP/release.jks"
+          printf 'storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' \
+            "$RUNNER_TEMP/release.jks" "$KEYSTORE_PASSWORD" "$KEYSTORE_ALIAS" "$KEYSTORE_PASSWORD" \
+            > android/keystore.properties
+
+      - name: Warn about missing keystore
+        if: env.HAS_KEYSTORE != 'true'
+        run: echo "::warning::No KEYSTORE_* secrets; APK signed with a debug key (run scripts/make-keystore.sh)."
+
+      - name: Build APK
+        working-directory: android
+        run: >
+          gradle assembleRelease --no-daemon --stacktrace
+          -PbuildNumber=${{ steps.ver.outputs.build }}
+          -PupstreamVersion=${{ steps.ver.outputs.upstream }}
+          -PgithubRepo=${{ github.repository }}
+
+      - name: Collect release files
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          cp android/app/build/outputs/apk/release/app-release.apk "AssetRipper-Android-$TAG.apk"
+          sha256sum "AssetRipper-Android-$TAG.apk" > "AssetRipper-Android-$TAG.apk.sha256"
+          ls -lh AssetRipper-*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AssetRipper-Android
+          path: |
+            AssetRipper-Android-*.apk
+            AssetRipper-Android-*.apk.sha256
+          if-no-files-found: error
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.srcsha.outputs.sha }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          echo "AssetRipper ${{ steps.ver.outputs.upstream }} (build ${{ steps.ver.outputs.build }}), source ${SOURCE_SHA::7}" > notes.md
+          gh release create "$TAG" \
+            "AssetRipper-Android-$TAG.apk" \
+            "AssetRipper-Android-$TAG.apk.sha256" \
+            "AssetRipper-bionic-arm64-$TAG.zip" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes-file notes.md
+
+      - name: AOT probe (experimental)
+        if: github.event_name == 'workflow_dispatch' && inputs.aot
+        continue-on-error: true
+        run: bash scripts/aot-probe.sh
